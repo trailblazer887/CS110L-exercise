@@ -180,6 +180,13 @@ pub async fn read_from_stream(
     Ok(response)
 }
 
+/// This function test the response status from upstream.if status code is 200, return true, else
+/// return false.
+pub async fn read_status_from_stream(stream: &mut TcpStream) -> Result<bool, Error> {
+    let response = read_headers(stream).await?;
+    Ok(response.status().as_u16() == 200)
+}
+
 /// This function serializes a response to bytes and writes those bytes to the provided stream.
 ///
 /// You will need to modify this function in Milestone 2.

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::RwLock,
+    time::Duration,
 };
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
@@ -47,6 +48,8 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: RwLock<Vec<String>>,
+    /// Flags that denote the accessibility of upstream
+    flags: RwLock<Vec<u8>>,
 }
 
 #[tokio::main]
@@ -77,12 +80,49 @@ async fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
+    let len = options.upstream.len();
     let state = Arc::new(ProxyState {
         upstream_addresses: RwLock::new(options.upstream),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
+        flags: RwLock::new(vec![1; len]),
     });
+
+    // Failover with active health checks
+    let state_clone = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(
+            state_clone.active_health_check_interval as u64,
+        ));
+        loop {
+            interval.tick().await;
+            let read_lock = state_clone.upstream_addresses.read().await;
+
+            for (ix, upstream) in (*read_lock).iter().enumerate() {
+                let request = http::Request::builder()
+                    .method(http::Method::GET)
+                    .uri(state_clone.active_health_check_path.as_str())
+                    .header("Host", upstream)
+                    .body(Vec::new())
+                    .unwrap();
+                if let Ok(mut tcp_stream) = TcpStream::connect(upstream).await {
+                    if let Ok(_) = request::write_to_stream(&request, &mut tcp_stream).await {
+                        if let Ok(res) = response::read_status_from_stream(&mut tcp_stream).await {
+                            if res == true {
+                                let mut write_lock = state_clone.flags.write().await;
+                                write_lock[ix] = 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let mut write_lock = state_clone.flags.write().await;
+                write_lock[ix] = 0;
+            }
+        }
+    });
+
     loop {
         if let Ok((stream, _socket_addr)) = listener.accept().await {
             let state = Arc::clone(&state);
@@ -99,6 +139,13 @@ async fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::E
     let mut upstream_idx_iter = upstream_idx;
     let mut upstream_ip = &ad_lock[upstream_idx];
     loop {
+        // if upstream is inactive currently, jump over and try to connect with next upstream.
+        let read_lock = state.flags.read().await;
+        if read_lock[upstream_idx_iter] == 0 {
+            upstream_idx_iter = (upstream_idx_iter + 1) % len;
+            upstream_ip = &ad_lock[upstream_idx_iter];
+            continue;
+        }
         match TcpStream::connect(upstream_ip).await {
             Ok(stream) => return Ok(stream),
             Err(e) => {
