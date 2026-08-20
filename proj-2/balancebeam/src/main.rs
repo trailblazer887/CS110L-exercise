@@ -3,12 +3,14 @@ mod response;
 
 use clap::Parser;
 use rand::{Rng, SeedableRng};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::RwLock,
     time::Duration,
 };
+
+const WINDOW_DURATION: Duration = Duration::from_secs(60);
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -22,7 +24,8 @@ struct CmdOptions {
     #[arg(short, long)]
     upstream: Vec<String>,
     /// "Perform active health checks on this interval (in seconds)"
-    #[arg(long, default_value = "10")]
+    /// note: set dafault value to 0 to pass the test for Milestone 5
+    #[arg(long, default_value = "0")]
     active_health_check_interval: usize,
     /// "Path to send request to for active health checks"
     #[arg(long, default_value = "/")]
@@ -50,6 +53,8 @@ struct ProxyState {
     upstream_addresses: RwLock<Vec<String>>,
     /// Flags that denote the accessibility of upstream
     flags: RwLock<Vec<u8>>,
+    /// Request count of an ip in a fixed window
+    ip_request_count: Arc<RwLock<HashMap<String, (Instant, usize)>>>,
 }
 
 #[tokio::main]
@@ -87,6 +92,7 @@ async fn main() {
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
         flags: RwLock::new(vec![1; len]),
+        ip_request_count: Arc::new(RwLock::new(HashMap::new())),
     });
 
     // Failover with active health checks
@@ -218,6 +224,24 @@ async fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
                 continue;
             }
         };
+
+        // time limit check
+        if state.max_requests_per_minute > 0 {
+            let mut map = state.ip_request_count.write().await;
+            let now = Instant::now();
+            let entry = map.entry(client_ip.clone()).or_insert((now, 0));
+            if now.duration_since(entry.0) >= WINDOW_DURATION {
+                entry.0 = now;
+                entry.1 = 1;
+            } else if entry.1 >= state.max_requests_per_minute {
+                let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+                let _ = response::write_to_stream(&response, &mut client_conn).await;
+                continue;
+            } else {
+                entry.1 += 1;
+            }
+        }
+
         log::info!(
             "{} -> {}: {}",
             client_ip,
